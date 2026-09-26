@@ -62,14 +62,11 @@ class OpenAIRunner:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": agent.instruction},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=self.temperature,
-        )
+        messages = [
+            {"role": "system", "content": agent.instruction},
+            {"role": "user", "content": user_message},
+        ]
+        completion = self._create(client, messages)
         text = (completion.choices[0].message.content or "").strip()
 
         for hook in self.output_hooks:
@@ -77,6 +74,33 @@ class OpenAIRunner:
 
         text = await self._run_output_plugins(text)
         return text
+
+    def _create(self, client, messages: list[dict]):
+        """Chat Completions with two provider-compat retries (same model, no swap):
+
+        - Reasoning models (e.g. gpt-6-luna) only accept the default temperature.
+        - OpenRouter may only serve ``liquid/lfm-2.5-2.6b`` via its ``:free`` endpoint.
+        """
+        model = self.model
+        kwargs = {"temperature": self.temperature}
+        for _ in range(3):
+            try:
+                return client.chat.completions.create(
+                    model=model, messages=messages, **kwargs
+                )
+            except Exception as e:
+                msg = str(e)
+                if "temperature" in msg and kwargs:
+                    kwargs = {}
+                elif (
+                    self.provider == "openrouter"
+                    and "No endpoints found" in msg
+                    and not model.endswith(":free")
+                ):
+                    model = f"{model}:free"
+                else:
+                    raise
+        return client.chat.completions.create(model=model, messages=messages, **kwargs)
 
     async def _run_input_plugins(self, user_message: str) -> str | None:
         if not self.plugins:

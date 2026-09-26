@@ -27,6 +27,33 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+# Thứ tự quan trọng: secret trước (để "password: admin123" bị che trọn),
+# rồi tới PII. Mọi match thay bằng [REDACTED].
+PII_PATTERNS = {
+    "api_key": r"\bsk-[A-Za-z0-9_-]{6,}",
+    "password": (
+        r"(?:password|passwd|pwd|pass\s*code|mat\s*khau|mật\s*khẩu)"
+        r"\s*(?:[:=]|\bis\b|\blà\b)\s*[\"'`]?[^\s\"'`,;]+"
+    ),
+    "admin_password": r"\badmin123\b",
+    "internal_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}",
+    "vn_phone": r"(?<!\d)(?:\+84|0)[235789](?:[\s.-]?\d){8,9}(?!\d)",
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+}
+
+# Secret demo đã chuẩn hoá (bỏ ký tự đặc biệt) — bắt kiểu né "a-d-m-i-n-1-2-3", "s k - v i n..."
+_OBFUSCATED_SECRETS = ("admin123", "skvinbanksecret2024", "dbvinbankinternal")
+
+
+def contains_obfuscated_secret(text: str) -> bool:
+    import unicodedata
+
+    norm = unicodedata.normalize("NFKC", text or "").lower()
+    norm = re.sub(r"[^a-z0-9]", "", norm)
+    return any(secret in norm for secret in _OBFUSCATED_SECRETS)
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -37,23 +64,18 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
-
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    redacted = response or ""
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Regex không bắt được nhưng secret vẫn còn dưới dạng bị chèn ký tự → che toàn bộ
+    if contains_obfuscated_secret(redacted):
+        issues.append("obfuscated_secret: 1 found")
+        redacted = "[REDACTED]"
 
     return {
         "safe": len(issues) == 0,
@@ -140,6 +162,14 @@ async def llm_safety_check(response_text: str) -> dict:
 #   - Return the (possibly modified) llm_response, or None to keep original
 # ============================================================
 
+# Issue thuộc nhóm secret nội bộ → chặn cả response thay vì chỉ che
+SECRET_ISSUES = {"api_key", "password", "admin_password", "internal_host", "obfuscated_secret"}
+SAFE_REFUSAL = (
+    "I cannot share internal system details. "
+    "How else can I help with your VinBank account or banking needs?"
+)
+
+
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
@@ -149,6 +179,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +203,37 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_issues = []
 
-        return llm_response  # TODO: modify if needed
+        # 1. Regex redaction (deterministic)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            self.last_issues = filtered["issues"]
+            secret_leak = any(
+                issue.split(":")[0] in SECRET_ISSUES for issue in filtered["issues"]
+            )
+            if secret_leak:
+                # Lộ secret nội bộ → fail-closed: thay cả câu trả lời
+                self.blocked_count += 1
+                llm_response.content = self._text_content(SAFE_REFUSAL)
+                return llm_response
+            llm_response.content = self._text_content(filtered["redacted"])
+            response_text = filtered["redacted"]
+
+        # 2. Optional LLM-as-Judge (không chấm)
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_issues.append(f"judge: {verdict['verdict'][:80]}")
+                llm_response.content = self._text_content(SAFE_REFUSAL)
+
+        return llm_response
+
+    @staticmethod
+    def _text_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
 
 # ============================================================

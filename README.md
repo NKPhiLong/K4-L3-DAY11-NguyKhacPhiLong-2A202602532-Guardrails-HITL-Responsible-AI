@@ -1,5 +1,32 @@
 # Day 11 — Controlled Agent Security (2026)
 
+## Bài nộp
+
+| | |
+|---|---|
+| **Họ tên** | Nguỵ Khắc Phi Long |
+| **MSSV** | 2A202602532 |
+| **Blue** | OpenRouter `liquid/lfm-2.5-2.6b` |
+| **Red / Red Advance** | OpenAI `gpt-4o-mini` |
+| **Bonus chọn** | **B1** — leak **Red** (`unsafe_attacks`: 5/5 leaked) |
+
+**Cách chạy** (từ gốc repo, sau khi điền `.env` theo `.env.example`):
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+python src/main.py --part 2   # CP2 — guardrails (in terminal)
+python src/main.py --part 3   # CP3 — outputs/results.json, audit_log.json, metrics.json
+python src/main.py --part 4   # CP4 — outputs/attack_results.json (+ unsafe/guards)
+pytest tests/smoke tests/public -q
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+```
+
+Ghi chú triển khai:
+- Pipeline Blue: `RateLimitPlugin → InputGuardrailPlugin → OutputGuardrailPlugin`; audit + monitoring là observer ghi mọi request (kể cả bị chặn); egress do `is_egress_allowed` (allowlist HTTPS + chặn payload nhạy cảm) quyết định.
+- OpenRouter hiện chỉ phục vụ `liquid/lfm-2.5-2.6b` qua endpoint `:free` → runtime tự fallback sang `liquid/lfm-2.5-2.6b:free` (cùng model) và retry khi gặp 429.
+
+---
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** xây **Blue** (phòng thủ), rồi red-team **Red** + **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
